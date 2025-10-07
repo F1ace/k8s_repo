@@ -50,8 +50,8 @@ ansible_distribution_release }} stable"
 
     - name: Install containerd
       package:
-      name: containerd.io
-      state: present
+        name: containerd.io
+        state: present
 
     - name: Configure containerd
       ansible.builtin.copy:
