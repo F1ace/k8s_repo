@@ -79,12 +79,12 @@ ansible_distribution_release }} stable"
   
     - name: Install kubeadm, kubelet, kubectl
       package:
-      name:
-        - kubelet={{ k8s_version }}-00
-        - kubeadm={{ k8s_version }}-00
-        - kubectl={{ k8s_version }}-00
-      state: present
-      allow_downgrade: yes
+        name:
+          - kubelet={{ k8s_version }}-00
+          - kubeadm={{ k8s_version }}-00
+          - kubectl={{ k8s_version }}-00
+        state: present
+        allow_downgrade: yes
 
     - name: Hold Kubernetes packages to prevent auto-update
       ansible.builtin.shell: |
