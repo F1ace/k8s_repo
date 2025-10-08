@@ -1,0 +1,376 @@
+# site.yml — полный разворот Kubernetes через Ansible/Semaphore
+# Ожидаемые группы в inventory:
+#   [k8s_master]
+#   [k8s_workers]
+#   [k8s_all:children]
+#   k8s_master
+#   k8s_workers
+
+# ========= 01. Подготовка всех нод =========
+- name: Prepare all Kubernetes nodes
+  hosts: k8s_all
+  become: yes
+  gather_facts: yes
+  vars:
+    k8s_major_minor: "v1.28"           # ветка Kubernetes на pkgs.k8s.io
+    pod_network_cidr: "10.244.0.0/16"  # сеть подов (Calico)
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  tasks:
+    - name: Wait for dpkg/apt locks
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 1; done
+        while fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 1; done
+      changed_when: false
+
+    - name: Force APT to use IPv4 and sane timeouts
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        mode: '0644'
+        content: |
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "5";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+
+    # ---- SWAP OFF ----
+    - name: Disable swap NOW (idempotent)
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+      failed_when: false
+
+    - name: Remove any swap entries from /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\s+swap\s+'
+        state: absent
+
+    # ---- Базовые пакеты + утилиты, требуемые kubeadm/kubelet ----
+    - name: Ensure base packages present
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - iproute2
+          - iptables
+          - conntrack
+          - socat
+        state: present
+        update_cache: yes
+        force_apt_get: yes
+
+    - name: Ensure /etc/apt/keyrings exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    # ---- Репозиторий Kubernetes (pkgs.k8s.io) ----
+    - name: Add Kubernetes GPG key (keyring)
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/Release.key \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes.gpg
+
+    - name: Add Kubernetes apt repository (signed-by)
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Update apt cache (fresh)
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 0
+        force_apt_get: yes
+
+    # ---- containerd (Debian), полный конфиг + CRI + systemd cgroups ----
+    - name: Install containerd (Debian repo)
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+        force_apt_get: yes
+
+    - name: Create full default containerd config if missing
+      ansible.builtin.shell: |
+        test -f /etc/containerd/config.toml || containerd config default > /etc/containerd/config.toml
+      args:
+        executable: /bin/bash
+
+    - name: Ensure SystemdCgroup=true for runc
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Ensure CRI plugin is enabled (not disabled)
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '^disabled_plugins = .*$'
+        replace: 'disabled_plugins = []'
+      failed_when: false
+
+    - name: Enable & restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    # ---- ядро/сетевые настройки ----
+    - name: Persist kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load modules now
+      ansible.builtin.shell: modprobe overlay && modprobe br_netfilter
+      changed_when: false
+
+    - name: Persist sysctl settings for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables=1
+          net.bridge.bridge-nf-call-ip6tables=1
+          net.ipv4.ip_forward=1
+
+    - name: Apply sysctl
+      ansible.builtin.shell: sysctl --system
+      changed_when: false
+
+    # ---- kubelet/kubeadm/kubectl ----
+    - name: Install kubelet kubeadm kubectl (from pkgs.k8s.io {{ k8s_major_minor }})
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+        force_apt_get: yes
+
+    - name: Hold k8s package versions
+      ansible.builtin.shell: apt-mark hold kubelet kubeadm kubectl
+      changed_when: false
+
+    - name: Enable kubelet service
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    # ---- pre-pull control-plane images (резко снижает «долгий 6443») ----
+    - name: Detect kubeadm short version
+      ansible.builtin.shell: kubeadm version -o short
+      register: kvers
+      changed_when: false
+
+    - name: Pre-pull control plane images (with retries)
+      ansible.builtin.shell: >
+        kubeadm config images pull
+        --kubernetes-version {{ kvers.stdout }}
+        --cri-socket unix:///run/containerd/containerd.sock
+      register: pullres
+      retries: 6
+      delay: 20
+      until: pullres.rc == 0
+      changed_when: false
+
+# ========= 02. Инициализация master (с автолечением) =========
+- name: Initialize control-plane on master
+  hosts: k8s_master
+  become: yes
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+  tasks:
+    - name: Check if admin.conf exists
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: adminconf
+
+    - name: If admin.conf exists — probe /readyz
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: pre_readyz
+      when: adminconf.stat.exists
+      failed_when: false
+      changed_when: false
+
+    - name: Reset broken/half-initialized control-plane
+      ansible.builtin.shell: kubeadm reset -f
+      when: adminconf.stat.exists and pre_readyz.rc != 0
+
+    - name: kubeadm init (only if fresh or after reset)
+      ansible.builtin.shell: |
+        kubeadm init \
+          --pod-network-cidr={{ pod_network_cidr }} \
+          --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
+          --cri-socket unix:///run/containerd/containerd.sock
+      when: (not adminconf.stat.exists) or (pre_readyz.rc != 0)
+
+    # kubeconfig всегда для root
+    - name: Prepare kubeconfig for root
+      ansible.builtin.shell: |
+        install -d -m 0700 /root/.kube
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+        chown root:root /root/.kube/config
+
+    # Ждём реальную готовность API
+    - name: Wait for API server TCP port (6443)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        timeout: 900
+
+    - name: Wait until apiserver is really ready (/readyz)
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz
+      retries: 60
+      delay: 5
+      until: readyz.rc == 0
+      changed_when: false
+
+    - name: Obtain join command (with retries)
+      ansible.builtin.shell: >
+        kubeadm token create
+        --kubeconfig /etc/kubernetes/admin.conf
+        --print-join-command
+      register: join_cmd
+      retries: 20
+      delay: 6
+      until: join_cmd.rc == 0
+
+    - name: Save join script on master
+      ansible.builtin.copy:
+        dest: /tmp/k8s_join.sh
+        mode: '0755'
+        content: "{{ join_cmd.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
+
+# ========= 03. Присоединение воркеров =========
+- name: Join worker nodes to the cluster
+  hosts: k8s_workers
+  become: yes
+  vars:
+    master_host: "{{ groups['k8s_master'][0] }}"
+  tasks:
+    - name: Fetch join script from master
+      ansible.builtin.slurp:
+        src: /tmp/k8s_join.sh
+      register: join_file
+      delegate_to: "{{ master_host }}"
+
+    - name: Run join script (idempotent via kubelet.conf)
+      ansible.builtin.shell: "{{ join_file.content | b64decode }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+# ========= 04. Calico CNI (устойчиво) =========
+- name: Install Calico CNI on master (robust)
+  hosts: k8s_master
+  become: yes
+  tasks:
+    # 1) гарантируем, что API стабилен
+    - name: Ensure apiserver is ready (/readyz) before CNI apply
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz_before_calico
+      retries: 60
+      delay: 5
+      until: readyz_before_calico.rc == 0
+      changed_when: false
+
+    # 2) применяем Calico с ретраями (гасим кратковременные ошибки API)
+    - name: Apply Calico manifest (retry on transient apiserver errors)
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      register: calico_apply
+      retries: 15
+      delay: 8
+      until: calico_apply.rc == 0
+
+    # 3) ждём появление CRD Calico
+    - name: Wait for Calico CRDs to appear
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        api-resources | grep -q projectcalico.org
+      register: calico_crd
+      retries: 60
+      delay: 5
+      until: calico_crd.rc == 0
+      changed_when: false
+
+    # 4) УСТОЙЧИВО ждём rollout DaemonSet'а calico-node.
+    #    Если API "упал" → ждём/чиняем kubelet и продолжаем.
+    - name: Wait for calico-node rollout with self-heal loop
+      ansible.builtin.shell: |
+        set -e
+        # до 30 итераций по 10 сек = ~5 минут; при необходимости повышай значения
+        for i in $(seq 1 30); do
+          if kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw='/readyz?verbose' >/dev/null 2>&1; then
+            if kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system rollout status ds/calico-node --timeout=60s >/dev/null 2>&1; then
+              echo "calico-node rolled out"
+              exit 0
+            fi
+          else
+            # kube-apiserver недоступен — убедимся, что kubelet активен
+            systemctl is-active kubelet >/dev/null 2>&1 || systemctl restart kubelet || true
+          fi
+          sleep 10
+        done
+        echo "calico-node rollout not finished or apiserver unstable" >&2
+        exit 1
+      register: calico_rollout_loop
+      changed_when: false
+
+    # 5) диагностический вывод на будущее
+    - name: Show kube-system pods (diagnostic)
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -o wide
+      register: ks_pods
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ ks_pods.stdout }}"
+
+# ========= 05. Проверка (nodes + smoke test) =========
+- name: Verify cluster and run a smoke test
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - name: Ensure apiserver is ready before verification
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz_verify
+      retries: 60
+      delay: 5
+      until: readyz_verify.rc == 0
+      changed_when: false
+
+    - name: Show nodes (should be Ready on all)
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ nodes.stdout }}"
+
+    - name: Deploy nginx in 'test' namespace and expose it
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf create ns test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf create deploy nginx-test --image=nginx:alpine -n test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf expose deploy nginx-test --port=80 --target-port=80 -n test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf rollout status deploy/nginx-test -n test --timeout=180s
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n test -o wide
+      register: pods
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ pods.stdout }}"
